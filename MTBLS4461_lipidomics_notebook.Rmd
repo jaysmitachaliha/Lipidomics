@@ -1,0 +1,904 @@
+---
+title: "Lipidomics Workflow — MTBLS4461"
+subtitle: "An Unbiased Lipid Phenotyping Approach To Study the Genetic Determinants of Lipids and Their Association with Coronary Heart Disease Risk Factors"
+author: "Jaysmita Chaliha"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = "#>",
+  fig.align = "center"
+)
+```
+
+---
+
+## Study Overview
+
+| Field | Detail |
+|---|---|
+| **MetaboLights ID** | [MTBLS4461](https://www.ebi.ac.uk/metabolights/MTBLS4461) |
+| **Technique** | Direct-infusion MS (DI-MS), alternating polarity |
+| **Instrument** | Thermo Exactive Orbitrap |
+| **Matrix** | Human serum |
+| **Cohort** | Pakistani control subjects from a case-control MI study |
+| **Biological factors** | Gender, Age, Diabetes status |
+
+Samples were infused directly into the mass spectrometer without prior chromatographic separation, enabling high-throughput profiling across a large epidemiological cohort. The absence of chromatography increases ion suppression, making normalisation a critical step in the analytical pipeline.
+
+---
+
+## 0. Packages
+
+```{r packages}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+cran_pkgs <- c(
+  "tidyverse",    # dplyr, ggplot2, stringr, readr, tidyr
+  "janitor",      # clean_names() — makes column names R-safe
+  "pheatmap",     # clustered heatmaps
+  "ggrepel",      # non-overlapping text labels on volcano plots
+  "patchwork",    # stitch ggplot panels together
+  "RColorBrewer", # colour palettes
+  "knitr",        # kable() for formatted tables
+  "kableExtra"    # enhanced kable styling
+)
+
+bioc_pkgs <- c(
+  "limma",   # eBayes differential abundance — the industry standard
+  "impute"   # KNN imputation for missing values
+)
+
+install.packages(setdiff(cran_pkgs, rownames(installed.packages())),
+                 quiet = TRUE)
+BiocManager::install(setdiff(bioc_pkgs, rownames(installed.packages())),
+                     ask = FALSE, quiet = TRUE)
+
+suppressPackageStartupMessages(
+  lapply(c(cran_pkgs, bioc_pkgs), library, character.only = TRUE)
+)
+```
+
+---
+
+## 1. Data Acquisition
+
+Files are retrieved from the MetaboLights REST API. An FTP mirror is available at `ftp://ftp.ebi.ac.uk/pub/databases/metabolights/studies/public/MTBLS4461/`.
+
+```{r download}
+dir.create("data/MTBLS4461", recursive = TRUE, showWarnings = FALSE)
+
+download_if_missing <- function(filename, dest_dir = "data/MTBLS4461") {
+  dest <- file.path(dest_dir, filename)
+  if (!file.exists(dest)) {
+    url <- paste0(
+      "https://www.ebi.ac.uk/metabolights/ws/studies/MTBLS4461/download?file=",
+      URLencode(filename, reserved = TRUE)
+    )
+    message("Downloading: ", filename)
+    download.file(url, destfile = dest, mode = "wb", quiet = TRUE)
+  }
+  invisible(dest)
+}
+
+download_if_missing("s_MTBLS4461.txt")
+download_if_missing("a_MTBLS4461_DI-MS_alternating__metabolite_profiling.txt")
+download_if_missing("m_MTBLS4461_DI-MS_alternating__metabolite_profiling_v2_maf.tsv")
+download_if_missing("m_MTBLS4461_DI-MS_positive__metabolite_profiling_v2_maf.tsv_SPLIT")
+
+message("All files ready.")
+```
+
+---
+
+## 2. Data Import & Inspection
+
+### 2a. Sample Metadata
+
+The `s_` file is in ISA-Tab format. Ontology term columns are dropped; three biological factors are retained: gender, age, and diabetes status.
+
+```{r metadata}
+meta_raw <- read_tsv(
+  "data/MTBLS4461/s_MTBLS4461.txt",
+  show_col_types = FALSE
+)
+
+metadata <- meta_raw |>
+  select(
+    sample_name = `Sample Name`,
+    source_name = `Source Name`,
+    gender      = `Factor Value[Gender]`,
+    age         = `Factor Value[Age]`,
+    diabetes    = `Factor Value[Diabetes]`
+  ) |>
+  mutate(
+    age      = as.numeric(age),
+    gender   = factor(gender),
+    diabetes = na_if(diabetes, "") |> factor()
+  )
+
+cat("Total samples:", nrow(metadata), "\n")
+```
+
+```{r metadata-tables}
+# Gender distribution
+table(metadata$gender, useNA = "ifany") |>
+  as.data.frame() |>
+  setNames(c("Gender", "Count")) |>
+  kable(caption = "Gender distribution") |>
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+# Diabetes distribution
+table(metadata$diabetes, useNA = "ifany") |>
+  as.data.frame() |>
+  setNames(c("Diabetes", "Count")) |>
+  kable(caption = "Diabetes status") |>
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+# Age summary
+summary(metadata$age) |>
+  t() |>
+  kable(caption = "Age distribution (years)",
+        digits = 1) |>
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r metadata-preview}
+head(metadata, 8) |>
+  kable(caption = "First 8 rows of cleaned metadata") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+```
+
+### 2b. MAF Data Matrix
+
+The MAF (MetaboLights Annotation Format) file contains one row per lipid feature. The first 21 columns are annotation fields; sample abundance columns follow. Three spurious unnamed columns are removed on import.
+
+```{r read-maf}
+read_maf <- function(path) {
+  maf <- read_tsv(path, show_col_types = FALSE)
+
+  # Drop unnamed junk columns (Unnamed: 21/22/23)
+  maf <- maf |> select(-starts_with("Unnamed"))
+
+  # Known annotation columns — metabolite_identification is intentionally
+  # excluded here; it is handled separately as the row identifier to avoid
+  # it appearing twice in select() calls.
+  annot_cols <- c(
+    "database_identifier", "chemical_formula", "smiles", "inchi",
+    "mass_to_charge", "fragmentation", "modifications", "charge",
+    "retention_time", "taxid", "species", "database", "database_version",
+    "reliability", "uri", "search_engine", "search_engine_score",
+    "smallmolecule_abundance_sub", "smallmolecule_abundance_stdev_sub",
+    "smallmolecule_abundance_std_error_sub"
+  )
+
+  # Which of those are actually present in this file
+  present_annot <- intersect(annot_cols, names(maf))
+
+  # Sample columns = everything that is not an annotation or the ID column
+  non_sample  <- c("metabolite_identification", present_annot)
+  sample_cols <- setdiff(names(maf), non_sample)
+
+  # ── Build unique row IDs ────────────────────────────────────────────────
+  # Duplicates occur when the same lipid name appears at multiple m/z values
+  # (different adducts e.g. [M+H]+, [M+Na]+) or across both polarities.
+  # column_to_rownames() hard-errors on any duplicate, so we disambiguate
+  # by appending the rounded m/z; numeric suffix is the last-resort fallback.
+  n_dupes <- sum(duplicated(maf$metabolite_identification, incomparables = NA))
+
+  if (n_dupes > 0) {
+    message(n_dupes, " duplicate metabolite_identification entries detected — ",
+            "appending m/z to create unique row IDs.")
+
+    mz_vals <- round(as.numeric(maf$mass_to_charge), 4)
+    is_dup  <- duplicated(maf$metabolite_identification) |
+               duplicated(maf$metabolite_identification, fromLast = TRUE)
+    row_ids <- ifelse(is_dup,
+                      paste0(maf$metabolite_identification, " [", mz_vals, "]"),
+                      maf$metabolite_identification)
+
+    # Numeric suffix if name+m/z is still not unique
+    if (anyDuplicated(row_ids)) {
+      row_ids <- ave(row_ids, row_ids, FUN = function(x) {
+        if (length(x) > 1) paste0(x, "_", seq_along(x)) else x
+      })
+    }
+  } else {
+    row_ids <- maf$metabolite_identification
+  }
+
+  # ── Assemble outputs ────────────────────────────────────────────────────
+  annot_out <- maf |>
+    select(all_of(present_annot)) |>
+    mutate(metabolite_identification = row_ids, .before = 1)
+
+  abund_out <- maf |>
+    select(all_of(sample_cols)) |>
+    mutate(metabolite_identification = row_ids) |>
+    column_to_rownames("metabolite_identification") |>
+    mutate(across(everything(), as.numeric)) |>
+    as.matrix()
+
+  list(annotation = annot_out, abundance = abund_out)
+}
+
+maf_alt <- read_maf(
+  "data/MTBLS4461/m_MTBLS4461_DI-MS_alternating__metabolite_profiling_v2_maf.tsv"
+)
+
+annot_df      <- maf_alt$annotation
+abundance_mat <- maf_alt$abundance
+
+cat("Lipid features:", nrow(abundance_mat), "\n")
+cat("Samples in MAF:", ncol(abundance_mat), "\n")
+```
+
+```{r sample-match}
+# Match samples between MAF and metadata
+shared_samples <- intersect(colnames(abundance_mat), metadata$sample_name)
+cat("Samples matched between MAF and metadata:", length(shared_samples), "\n")
+
+if (length(shared_samples) == 0) {
+  stop(paste(
+    "No matching sample IDs found between MAF and metadata.",
+    "Check for whitespace or formatting differences with trimws()."
+  ))
+}
+
+# Subset to shared samples
+abundance_mat <- abundance_mat[, shared_samples]
+metadata      <- filter(metadata, sample_name %in% shared_samples) |>
+  arrange(match(sample_name, shared_samples))
+```
+
+```{r annotation-preview}
+# Preview the annotation columns
+annot_df |>
+  select(metabolite_identification, mass_to_charge, database_identifier) |>
+  head(10) |>
+  kable(caption = "First 10 lipid features (annotation preview)") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+```
+
+---
+
+## 3. Quality Control
+
+### 3a. Missing Values
+
+Missing values arise when a lipid signal falls below the instrument detection threshold. The distributions across features and samples are assessed before filtering.
+
+```{r missing-values, fig.height=5}
+miss_feat   <- rowMeans(is.na(abundance_mat)) * 100
+miss_sample <- colMeans(is.na(abundance_mat)) * 100
+
+p_miss_feat <- ggplot(data.frame(pct = miss_feat), aes(x = pct)) +
+  geom_histogram(bins = 40, fill = "#2C7BB6", colour = "white") +
+  labs(title = "Missing values per lipid feature",
+       x = "% Missing", y = "Feature count") +
+  theme_bw(base_size = 12)
+
+p_miss_samp <- ggplot(
+  data.frame(sample = names(miss_sample), pct = miss_sample),
+  aes(x = reorder(sample, pct), y = pct)
+) +
+  geom_bar(stat = "identity", fill = "#D7191C") +
+  labs(title = "Missing values per sample",
+       x = "Sample (sorted by % missing)", y = "% Missing") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+p_miss_feat + p_miss_samp
+```
+
+### 3b. Feature Filtering
+
+Features missing in more than 30% of samples are removed.
+
+```{r feature-filter}
+abundance_filt <- abundance_mat[miss_feat < 30, ]
+
+cat(
+  "Features before filter:", nrow(abundance_mat), "\n",
+  "Features after filter: ", nrow(abundance_filt), "\n",
+  "Features removed:      ", nrow(abundance_mat) - nrow(abundance_filt), "\n"
+)
+```
+
+### 3c. Poor-Quality Sample Flagging
+
+```{r sample-flag}
+bad_samples <- names(miss_sample[miss_sample > 50])
+
+if (length(bad_samples) > 0) {
+  cat("⚠️  Samples with >50% missing — consider exclusion:\n")
+  cat(paste(bad_samples, collapse = ", "), "\n")
+} else {
+  cat("✅ No samples exceed 50% missing threshold.\n")
+}
+```
+
+### 3d. Total Ion Signal (Pre-normalisation)
+
+Total ion signal (TIS) variation across samples reflects global intensity differences that normalisation must account for.
+
+```{r tis-plot, fig.height=5}
+tis_df <- data.frame(
+  sample = colnames(abundance_filt),
+  tis    = colSums(abundance_filt, na.rm = TRUE)
+) |>
+  left_join(select(metadata, sample_name, gender, diabetes),
+            by = c("sample" = "sample_name"))
+
+ggplot(tis_df, aes(x = reorder(sample, tis), y = tis / 1e6, fill = gender)) +
+  geom_bar(stat = "identity") +
+  scale_fill_brewer(palette = "Set1", na.value = "grey60") +
+  labs(
+    title = "Total ion signal per sample (raw, pre-normalisation)",
+    x     = "Sample (sorted by TIS)",
+    y     = "Sum intensity (×10⁶)",
+    fill  = "Gender"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+---
+
+## 4. Normalisation
+
+### PQN
+
+Probabilistic Quotient Normalisation (PQN) is applied. A reference spectrum is constructed from the per-feature median across all samples; each sample's normalisation factor is then the median of its quotients against that reference. This approach is robust when only a subset of lipids differ between samples, which TIC normalisation does not account for (Dieterle et al., 2006).
+
+```{r pqn-normalise}
+pqn_normalise <- function(mat) {
+  ref       <- apply(mat, 1, median, na.rm = TRUE)
+  quotients <- mat / ref
+  nf        <- apply(quotients, 2, median, na.rm = TRUE)
+  cat("PQN normalisation factors:\n")
+  cat("  Mean:", round(mean(nf), 4),
+      "| SD:", round(sd(nf), 4),
+      "| Range:", round(range(nf), 4), "\n")
+  sweep(mat, 2, nf, "/")
+}
+
+abundance_pqn <- pqn_normalise(abundance_filt)
+```
+
+### Log₂ Transform
+
+Log₂ transformation stabilises variance across the intensity range and symmetrises the distribution prior to linear modelling.
+
+```{r log-transform}
+abundance_log <- log2(abundance_pqn + 1)
+```
+
+### Pre-imputation Filter & KNN Imputation
+
+Remaining missing values are filled by KNN imputation (`k = 5`), which borrows from the five most similar features. A secondary 50% missingness filter is applied immediately before imputation: PQN can introduce new NAs where a feature's reference median is zero, and subsetting to shared samples can shift per-feature missingness proportions beyond the threshold applied in section 3.
+
+```{r knn-impute}
+# ── Final missingness filter ─────────────────────────────────────────────
+miss_feat_pre <- rowMeans(is.na(abundance_log))
+miss_samp_pre <- colMeans(is.na(abundance_log))
+
+n_feat_drop <- sum(miss_feat_pre >= 0.5)
+n_samp_drop <- sum(miss_samp_pre >= 0.5)
+if (n_feat_drop > 0)
+  message(n_feat_drop, " features with >= 50% missing removed before imputation.")
+if (n_samp_drop > 0)
+  message(n_samp_drop, " samples with >= 50% missing removed before imputation.")
+
+abundance_log_clean <- abundance_log[miss_feat_pre < 0.5, miss_samp_pre < 0.5]
+cat("Matrix entering imputation:",
+    nrow(abundance_log_clean), "features x",
+    ncol(abundance_log_clean), "samples
+")
+
+# ── KNN imputation ────────────────────────────────────────────────────────
+if (requireNamespace("impute", quietly = TRUE)) {
+  library(impute)
+  mat <- impute.knn(abundance_log_clean, k = 5)$data
+  cat("KNN imputation complete (k = 5).
+")
+} else {
+  mat <- abundance_log_clean
+  for (i in seq_len(nrow(mat))) {
+    row_med <- median(mat[i, ], na.rm = TRUE)
+    mat[i, is.na(mat[i, ])] <- row_med
+  }
+  cat("Median imputation used (install Bioc 'impute' for KNN).
+")
+}
+
+stopifnot("NAs remain after imputation" = sum(is.na(mat)) == 0)
+cat("Final matrix:", nrow(mat), "features x", ncol(mat), "samples
+")
+
+# Realign metadata to the (possibly reduced) sample set after filters
+metadata <- filter(metadata, sample_name %in% colnames(mat)) |>
+  arrange(match(sample_name, colnames(mat)))
+```
+
+---
+
+## 5. Lipid Class Summarisation
+
+This MAF uses full English lipid names rather than LIPID MAPS abbreviations. Names are parsed and mapped to standard short codes. Total carbon count and degree of unsaturation are extracted from the chain notation (e.g. `34:1` → 34 carbons, 1 double bond).
+
+```{r lipid-parse}
+# The MAF file uses full English names (e.g. "phosphatidylcholine 34:1")
+# rather than LIPID MAPS abbreviations. We map the first word(s) of each
+# name to a standard short code. The lookup covers every class seen in
+# this dataset's table(lipid_class) output.
+class_lookup <- c(
+  "phosphatidylcholine"          = "PC",
+  "lysophosphatidylcholine"      = "LPC",
+  "phosphatidylethanolamine"     = "PE",
+  "lysophosphatidylethanolamine" = "LPE",
+  "phosphatidylserine"           = "PS",
+  "phosphatidylinositol"         = "PI",
+  "phosphatidylinositole"        = "PI",      # alternate spelling in MAF
+  "phosphatidylglycerol"         = "PG",
+  "phosphatidylglicerate"        = "PG",      # typo variant in MAF
+  "phosphatidic"                 = "PA",      # "phosphatidic acid"
+  "Phosphatidic"                 = "PA",
+  "phosphatidynserine"           = "PS",      # typo variant
+  "sphingomyelin"                = "SM",
+  "triacylglycerol"              = "TG",
+  "diacylglycerol"               = "DG",
+  "cholesteryl"                  = "CE",
+  "cholesterol"                  = "Chol",
+  "Ceramide"                     = "Cer",
+  "CEoxid"                       = "oxCE",
+  "CE"                           = "CE",
+  "Cer"                          = "Cer",
+  "DG"                           = "DG",
+  "PG"                           = "PG",
+  "fatty"                        = "FA",      # "fatty acid"
+  "docosapentaenoate"            = "FA",
+  "docosatetraenoate"            = "FA",
+  "octadecadienoate"             = "FA",
+  "octadecatrienoate"            = "FA",
+  "octadecenoate"                = "FA",
+  "hexadecenoate"                = "FA",
+  "icosatetraenoate"             = "FA",
+  "tetracosenoate"               = "FA",
+  "tricosanoate"                 = "FA",
+  "Tritridecanoin"               = "TG",
+  "all"                          = "other",
+  "NA"                           = NA_character_
+)
+
+lipid_annot <- annot_df |>
+  filter(metabolite_identification %in% rownames(mat)) |>
+  transmute(
+    lipid        = metabolite_identification,
+    # Extract the first word to use as the lookup key
+    first_word   = str_extract(lipid, "^[^\\s\\[]+"),
+    lipid_class  = class_lookup[first_word],
+    # Fatty acid chain info: total carbons and double bonds
+    chain_info   = str_extract(lipid, "\\d+:\\d+"),
+    carbons      = as.integer(str_extract(chain_info, "^\\d+")),
+    double_bonds = as.integer(str_extract(chain_info, "(?<=:)\\d+"))
+  ) |>
+  select(-first_word)
+
+# Summary
+class_counts <- count(lipid_annot, lipid_class, sort = TRUE)
+cat("Lipid classes after standardisation:\n")
+print(class_counts, n = Inf)
+```
+
+### Feature count per class
+
+```{r class-count-plot}
+ggplot(class_counts,
+       aes(x = reorder(lipid_class, n), y = n, fill = lipid_class)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Lipid species detected per class",
+       x = NULL, y = "Number of features") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+```{r class-count-table}
+class_counts |>
+  mutate(pct = round(n / sum(n) * 100, 1)) |>
+  kable(col.names = c("Lipid class", "Features", "% of total"),
+        caption = "Detected lipid classes") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Mean abundance per class
+
+```{r class-abundance}
+class_abundance <- as.data.frame(mat) |>
+  rownames_to_column("lipid") |>
+  left_join(select(lipid_annot, lipid, lipid_class), by = "lipid") |>
+  group_by(lipid_class) |>
+  summarise(across(where(is.numeric), \(x) sum(x, na.rm = TRUE)),
+            .groups = "drop") |>
+  mutate(mean_across_samples = rowMeans(across(where(is.numeric)))) |>
+  arrange(desc(mean_across_samples))
+
+ggplot(class_abundance,
+       aes(x = reorder(lipid_class, mean_across_samples),
+           y = mean_across_samples, fill = lipid_class)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Mean summed log₂ abundance by lipid class",
+       x = NULL, y = "Mean log₂ (sum across samples)") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+---
+
+## 6. Exploratory Analysis
+
+PCA, correlation structure, and feature variance are examined across all samples prior to differential testing.
+
+```{r pca-setup}
+pca_res <- prcomp(t(mat), center = TRUE, scale. = TRUE)
+var_exp <- round(summary(pca_res)$importance[2, 1:10] * 100, 1)
+
+pca_df <- as.data.frame(pca_res$x[, 1:5]) |>
+  rownames_to_column("sample_name") |>
+  left_join(metadata, by = "sample_name")
+```
+
+### 6a. PCA — Diabetes & Gender
+
+```{r pca-diabetes, fig.height=5}
+ggplot(pca_df, aes(x = PC1, y = PC2, colour = diabetes, shape = gender)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_colour_brewer(palette = "Set1", na.value = "grey60") +
+  labs(
+    title  = "PCA — log₂ PQN-normalised lipidome",
+    x      = paste0("PC1 (", var_exp[1], "%)"),
+    y      = paste0("PC2 (", var_exp[2], "%)"),
+    colour = "Diabetes",
+    shape  = "Gender"
+  ) +
+  theme_bw(base_size = 12)
+```
+
+```{r pca-age, fig.height=5}
+ggplot(pca_df, aes(x = PC1, y = PC2, colour = age)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_colour_viridis_c(option = "plasma") +
+  labs(
+    title  = "PCA — coloured by age",
+    x      = paste0("PC1 (", var_exp[1], "%)"),
+    y      = paste0("PC2 (", var_exp[2], "%)"),
+    colour = "Age (yr)"
+  ) +
+  theme_bw(base_size = 12)
+```
+
+### 6b. Scree Plot
+
+```{r scree, fig.height=4}
+data.frame(PC = paste0("PC", 1:10), var = var_exp) |>
+  ggplot(aes(x = factor(PC, levels = paste0("PC", 1:10)), y = var)) +
+  geom_col(fill = "#4DAC26") +
+  geom_line(aes(group = 1)) +
+  geom_point(size = 2) +
+  labs(title = "Scree plot — variance explained per PC",
+       x = NULL, y = "% Variance explained") +
+  theme_bw(base_size = 12)
+```
+
+### 6c. Sample–Sample Correlation Heatmap
+
+Samples clustering by biological group rather than technical variation confirm adequate normalisation. Low-correlation outliers indicate candidates for further QC review.
+
+```{r cor-heatmap, fig.height=8}
+cor_mat <- cor(mat, use = "pairwise.complete.obs")
+
+col_annot <- metadata |>
+  select(sample_name, diabetes, gender) |>
+  column_to_rownames("sample_name") |>
+  mutate(across(everything(), as.character))
+
+pheatmap(
+  cor_mat,
+  color             = colorRampPalette(c("#4575B4", "white", "#D73027"))(100),
+  clustering_method = "ward.D2",
+  annotation_col    = col_annot,
+  show_rownames     = FALSE,
+  show_colnames     = FALSE,
+  main              = "Sample–sample Pearson correlation (PQN log₂)"
+)
+```
+
+### 6d. Feature Heatmap — Top 100 Most Variable Lipids
+
+```{r feature-heatmap, fig.height=9}
+top100_idx <- order(apply(mat, 1, var, na.rm = TRUE), decreasing = TRUE)[1:100]
+
+pheatmap(
+  mat[top100_idx, ],
+  scale             = "row",
+  color             = colorRampPalette(rev(brewer.pal(11, "RdYlBu")))(100),
+  clustering_method = "ward.D2",
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  annotation_col    = col_annot,
+  show_rownames     = FALSE,
+  show_colnames     = FALSE,
+  main              = "Top 100 most variable lipid species (row Z-score)"
+)
+```
+
+---
+
+## 7. Differential Abundance
+
+Differential abundance is tested using limma's empirical Bayes framework (Ritchie et al., 2015). Variance estimates are moderated across all features, which improves power at moderate sample sizes. Multiple testing is controlled by Benjamini-Hochberg FDR correction.
+
+> These samples are the control arm of an MI case-control study. Diabetes status reflects self-reported comorbidity within the control cohort.
+
+### 7a. Diabetes: Yes vs No
+
+```{r da-diabetes}
+meta_da <- filter(metadata, !is.na(diabetes))
+mat_da  <- mat[, meta_da$sample_name]
+
+group  <- factor(meta_da$diabetes)
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+fit  <- lmFit(mat_da, design)
+fit2 <- contrasts.fit(
+  fit,
+  makeContrasts(DiabetesYesVsNo = Yes - No, levels = design)
+) |> eBayes()
+
+da_results <- topTable(fit2, coef = "DiabetesYesVsNo",
+                       number = Inf, adjust.method = "BH") |>
+  rownames_to_column("lipid") |>
+  left_join(lipid_annot, by = "lipid") |>
+  arrange(adj.P.Val) |>
+  mutate(
+    sig       = adj.P.Val < 0.05 & abs(logFC) > 0.5,
+    direction = case_when(
+      sig & logFC >  0.5 ~ "Up in Diabetes",
+      sig & logFC < -0.5 ~ "Down in Diabetes",
+      TRUE               ~ "NS"
+    )
+  )
+
+cat("Significant lipids (FDR < 5%, |logFC| > 0.5):",
+    sum(da_results$sig, na.rm = TRUE), "\n")
+```
+
+```{r da-diabetes-table}
+da_results |>
+  filter(sig) |>
+  select(lipid, lipid_class, logFC, AveExpr, t, adj.P.Val) |>
+  head(20) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  kable(caption = "Top 20 diabetes-associated lipids (FDR < 5%)") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+```
+
+```{r volcano-diabetes, fig.height=6}
+ggplot(da_results, aes(x = logFC, y = -log10(P.Value), colour = direction)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+  geom_text_repel(
+    data = filter(da_results, sig),
+    aes(label = lipid), size = 2.5, max.overlaps = 20
+  ) +
+  scale_colour_manual(values = c(
+    "Up in Diabetes"   = "#D73027",
+    "Down in Diabetes" = "#4575B4",
+    "NS"               = "grey70"
+  )) +
+  labs(
+    title  = "Volcano plot: Diabetes Yes vs No (limma eBayes)",
+    x      = "log₂ Fold Change (Yes − No)",
+    y      = "−log₁₀(p-value)",
+    colour = NULL
+  ) +
+  theme_bw(base_size = 12)
+```
+
+### 7b. Gender: Male vs Female
+
+```{r da-gender}
+meta_gd <- filter(metadata, !is.na(gender))
+mat_gd  <- mat[, meta_gd$sample_name]
+grp_gd  <- factor(meta_gd$gender)
+des_gd  <- model.matrix(~ 0 + grp_gd)
+colnames(des_gd) <- levels(grp_gd)
+
+fit_gd <- lmFit(mat_gd, des_gd) |>
+  contrasts.fit(makeContrasts(MaleVsFemale = Male - Female, levels = des_gd)) |>
+  eBayes()
+
+gender_results <- topTable(fit_gd, coef = "MaleVsFemale",
+                           number = Inf, adjust.method = "BH") |>
+  rownames_to_column("lipid") |>
+  left_join(lipid_annot, by = "lipid") |>
+  arrange(adj.P.Val) |>
+  mutate(
+    sig       = adj.P.Val < 0.05 & abs(logFC) > 0.5,
+    direction = case_when(
+      sig & logFC >  0.5 ~ "Up in Male",
+      sig & logFC < -0.5 ~ "Up in Female",
+      TRUE               ~ "NS"
+    )
+  )
+
+cat("Significant lipids (FDR < 5%, |logFC| > 0.5):",
+    sum(gender_results$sig, na.rm = TRUE), "\n")
+```
+
+```{r volcano-gender, fig.height=6}
+ggplot(gender_results, aes(x = logFC, y = -log10(P.Value), colour = direction)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+  geom_text_repel(data = filter(gender_results, sig),
+                  aes(label = lipid), size = 2.5, max.overlaps = 20) +
+  scale_colour_manual(values = c("Up in Male"   = "#4575B4",
+                                 "Up in Female" = "#D73027",
+                                 "NS"           = "grey70")) +
+  labs(title = "Volcano plot: Male vs Female (limma eBayes)",
+       x = "log₂ Fold Change (Male − Female)",
+       y = "−log₁₀(p-value)", colour = NULL) +
+  theme_bw(base_size = 12)
+```
+
+---
+
+## 8. Lipid Species Visualisation
+
+### 8a. Carbon Chain Length Distribution
+
+```{r chain-length, fig.height=7}
+# Use the top classes actually present in this dataset
+top_classes <- class_counts |>
+  filter(!is.na(lipid_class), n >= 5) |>
+  slice_max(n, n = 6) |>
+  pull(lipid_class)
+
+lipid_annot |>
+  filter(!is.na(carbons), lipid_class %in% top_classes) |>
+  ggplot(aes(x = factor(carbons), fill = lipid_class)) +
+  geom_bar() +
+  facet_wrap(~ lipid_class, scales = "free_y", ncol = 3) +
+  labs(title = "Total fatty acid carbon chain length per class",
+       x = "Total carbons", y = "# species") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### 8b. Degree of Unsaturation
+
+Double bond count reflects the degree of polyunsaturation. PUFA composition influences membrane fluidity and is linked to eicosanoid-mediated inflammatory signalling.
+
+```{r unsaturation, fig.height=7}
+lipid_annot |>
+  filter(!is.na(double_bonds), lipid_class %in% top_classes) |>
+  ggplot(aes(x = factor(double_bonds), fill = lipid_class)) +
+  geom_bar() +
+  facet_wrap(~ lipid_class, scales = "free_y", ncol = 3) +
+  labs(title = "Degree of unsaturation (double bonds) per class",
+       x = "Double bonds", y = "# species") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "none")
+```
+
+### 8c. Lipid Class Composition
+
+```{r class-composition, fig.height=5}
+class_counts |>
+  mutate(pct = n / sum(n) * 100) |>
+  ggplot(aes(x = reorder(lipid_class, pct), y = pct, fill = lipid_class)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Lipid class composition (% of detected features)",
+       x = NULL, y = "% of features") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+### 8d. Top Diabetes-Associated Lipids — Boxplots
+
+```{r top-da-boxplots, fig.height=10}
+top_da <- filter(da_results, sig) |>
+  slice_min(adj.P.Val, n = 20) |>
+  pull(lipid)
+
+if (length(top_da) > 0) {
+  as.data.frame(mat[top_da, , drop = FALSE]) |>
+    rownames_to_column("lipid") |>
+    pivot_longer(-lipid, names_to = "sample_name", values_to = "log2_abund") |>
+    left_join(select(metadata, sample_name, diabetes), by = "sample_name") |>
+    filter(!is.na(diabetes)) |>
+    ggplot(aes(x = diabetes, y = log2_abund, fill = diabetes)) +
+    geom_boxplot(outlier.size = 0.8, alpha = 0.85) +
+    facet_wrap(~ lipid, scales = "free_y", ncol = 5) +
+    scale_fill_brewer(palette = "Set1") +
+    labs(title = "Top diabetes-associated lipids (FDR-ranked)",
+         x = "Diabetes status", y = "log₂ abundance",
+         fill = "Diabetes") +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "bottom")
+} else {
+  cat("No significant diabetes-associated lipids at the chosen thresholds.\n")
+}
+```
+
+---
+
+## 9. Export Results
+
+```{r export}
+dir.create("results", showWarnings = FALSE)
+
+write_csv(as.data.frame(mat) |> rownames_to_column("lipid"),
+          "results/abundance_pqn_log2_knn_imputed.csv")
+
+write_csv(lipid_annot,
+          "results/lipid_annotation_parsed.csv")
+
+write_csv(da_results,
+          "results/DA_diabetes_YesVsNo.csv")
+
+write_csv(gender_results,
+          "results/DA_gender_MaleVsFemale.csv")
+
+write_csv(metadata,
+          "results/metadata_clean.csv")
+
+cat("Results written to /results/\n")
+```
+
+---
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+## References
+
+| | Citation |
+|---|---|
+| **Dataset** | Castro C, Harshfield EL, Butterworth AS, Wood AM, Koulman A, Griffin JL. (2024). A lipidomic dataset for epidemiological studies of acute myocardial infarction. *Data in Brief* 57:110925 |
+| **Study** | Harshfield EL, Koulman A, Ziemek D, Marney L, Fauman EB, Paul DS, et al. (2019). An unbiased lipid phenotyping approach to study the genetic determinants of lipids and their association with coronary heart disease risk factors. *J. Proteome Res.* 18(6):2397–2410 |
+| **limma** | Ritchie et al. (2015) *Nucleic Acids Res.* doi:10.1093/nar/gkv007 |
+| **limma eBayes** | Smyth (2004) *Stat. Appl. Genet. Mol. Biol.* |
+| **impute** | Troyanskaya et al. (2001) *Bioinformatics* 17:520 |
+| **PQN** | Dieterle et al. (2006) *Anal. Chem.* 78:4281 |
+| **LIPID MAPS shorthand** | Liebisch et al. (2020) *J. Lipid Res.* 61:1650 |
+| **tidyverse** | Wickham et al. (2019) *JOSS* doi:10.21105/joss.01686 |
+| **pheatmap** | Kolde R (2019) CRAN |

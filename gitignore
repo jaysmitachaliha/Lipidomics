@@ -1,0 +1,18 @@
+# Downloaded data — not committed; re-fetched automatically on first run
+data/
+
+# Analysis outputs
+results/
+
+# Rendered notebook
+*.html
+
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# OS files
+.DS_Store
+Thumbs.db
