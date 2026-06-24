@@ -52,8 +52,6 @@ All data are publicly available at:
 A rendered HTML version of the notebook is available on RPubs:
 [https://rpubs.com/jaysmitachaliha/MTBLS4461-lipidomics](https://rpubs.com/jaysmitachaliha/MTBLS4461-lipidomics)
 
-*(Update this link after publishing to RPubs)*
-
 ---
 
 ## References
